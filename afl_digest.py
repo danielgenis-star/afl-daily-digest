@@ -5,8 +5,12 @@ AFL Daily Digest — Fully Autonomous Cloud Version
 Runs via GitHub Actions at 7:30 AM AEST every single day.
 Your Mac does NOT need to be on. No Claude app needed.
 
+Time window rules:
+  - Tuesday–Friday : fetches news from the PREVIOUS DAY only
+  - Saturday / Sunday / Monday : fetches news from the PREVIOUS 7 DAYS
+
 How it works:
-  1. Fetches AFL headlines from multiple public RSS feeds
+  1. Fetches AFL headlines from multiple public RSS feeds (date-filtered)
   2. Sends all headlines to Claude AI (Haiku) to write a rich digest
   3. Emails the digest to danielgenisd@gmail.com via Resend
 
@@ -24,7 +28,7 @@ import urllib.request
 import urllib.error
 import sys
 import feedparser
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
@@ -32,42 +36,90 @@ RESEND_API_KEY    = os.environ["RESEND_API_KEY"]
 TO_EMAIL          = "danielgenisd@gmail.com"
 MODEL             = "claude-haiku-4-5-20251001"   # Fast, cheap, great quality
 
-# Public RSS feeds — no login or API key needed
-FEEDS = [
-    ("AFL Official",        "https://www.afl.com.au/rss/news"),
-    ("Melbourne Demons",    "https://www.melbournefc.com.au/rss/news"),
-    ("The Guardian AFL",    "https://www.theguardian.com/sport/afl/rss"),
-    ("Google – AFL News",   "https://news.google.com/rss/search?q=AFL+news+Australia&hl=en-AU&gl=AU&ceid=AU:en"),
-    ("Google – Demons",     "https://news.google.com/rss/search?q=Melbourne+Demons+AFL&hl=en-AU&gl=AU&ceid=AU:en"),
-    ("Google – Injuries",   "https://news.google.com/rss/search?q=AFL+injury+update&hl=en-AU&gl=AU&ceid=AU:en"),
-    ("Google – Trade",      "https://news.google.com/rss/search?q=AFL+trade+rumour&hl=en-AU&gl=AU&ceid=AU:en"),
-    ("Google – Coaches",    "https://news.google.com/rss/search?q=AFL+coach+news&hl=en-AU&gl=AU&ceid=AU:en"),
-]
-MAX_PER_FEED = 8   # How many headlines to pull from each feed
+MAX_PER_FEED = 10   # How many headlines to pull from each feed
+
+
+# ── Date window logic ──────────────────────────────────────────────────────────
+def get_date_window():
+    """
+    Returns (date_from, date_to, window_label) based on current AEST day.
+
+    Tuesday–Friday         -> previous day only
+    Saturday/Sunday/Monday -> previous 7 days
+    """
+    aest = timezone(timedelta(hours=10))
+    now = datetime.now(tz=aest)
+    weekday = now.weekday()  # 0=Mon, 1=Tue, ..., 5=Sat, 6=Sun
+
+    if weekday in (0, 5, 6):  # Monday, Saturday, Sunday
+        date_from = (now - timedelta(days=7)).date()
+        date_to   = (now - timedelta(days=1)).date()
+        window_label = "the past week"
+    else:  # Tuesday-Friday
+        date_from = (now - timedelta(days=1)).date()
+        date_to   = (now - timedelta(days=1)).date()
+        window_label = "yesterday"
+
+    return date_from, date_to, window_label
+
+
+def build_feeds(after_str):
+    """Build RSS feed list with date-filtered Google News queries."""
+    return [
+        ("AFL Official",      "https://www.afl.com.au/rss/news"),
+        ("Melbourne Demons",  "https://www.melbournefc.com.au/rss/news"),
+        ("The Guardian AFL",  "https://www.theguardian.com/sport/afl/rss"),
+        ("Google - AFL News", f"https://news.google.com/rss/search?q=AFL+news+Australia+after:{after_str}&hl=en-AU&gl=AU&ceid=AU:en"),
+        ("Google - Demons",   f"https://news.google.com/rss/search?q=Melbourne+Demons+AFL+after:{after_str}&hl=en-AU&gl=AU&ceid=AU:en"),
+        ("Google - Injuries", f"https://news.google.com/rss/search?q=AFL+injury+update+after:{after_str}&hl=en-AU&gl=AU&ceid=AU:en"),
+        ("Google - Trade",    f"https://news.google.com/rss/search?q=AFL+trade+rumour+after:{after_str}&hl=en-AU&gl=AU&ceid=AU:en"),
+        ("Google - Coaches",  f"https://news.google.com/rss/search?q=AFL+coach+news+after:{after_str}&hl=en-AU&gl=AU&ceid=AU:en"),
+    ]
 
 
 # ── Step 1: Fetch news ─────────────────────────────────────────────────────────
-def fetch_all_news() -> str:
-    """Pull headlines from all RSS feeds and return as a plain-text block."""
+def fetch_all_news(date_from, date_to) -> str:
+    """Pull headlines from all RSS feeds, filtered to the relevant date window."""
+    after_str = date_from.strftime("%Y-%m-%d")
+    feeds = build_feeds(after_str)
+
     lines = []
-    for label, url in FEEDS:
+    for label, url in feeds:
         try:
             feed = feedparser.parse(url)
-            for entry in feed.entries[:MAX_PER_FEED]:
+            count = 0
+            for entry in feed.entries:
+                if count >= MAX_PER_FEED:
+                    break
+
+                # Try to filter by published date
+                pub_date = None
+                if hasattr(entry, "published_parsed") and entry.published_parsed:
+                    pub_date = date(*entry.published_parsed[:3])
+                elif hasattr(entry, "updated_parsed") and entry.updated_parsed:
+                    pub_date = date(*entry.updated_parsed[:3])
+
+                # Skip entries outside our window (if we can determine the date)
+                if pub_date and (pub_date < date_from or pub_date > date_to):
+                    continue
+
                 title   = (entry.get("title")   or "").strip()
                 summary = (entry.get("summary") or "")[:300].strip()
                 if title:
-                    lines.append(f"[{label}] {title}. {summary}")
+                    date_tag = f" [{pub_date}]" if pub_date else ""
+                    lines.append(f"[{label}]{date_tag} {title}. {summary}")
+                    count += 1
+
         except Exception as exc:
             print(f"  Warning: could not fetch {label}: {exc}")
 
     result = "\n".join(lines)
-    print(f"  Collected {len(lines)} headlines from {len(FEEDS)} feeds")
+    print(f"  Collected {len(lines)} headlines from {len(feeds)} feeds")
     return result
 
 
 # ── Step 2: Generate digest with Claude AI ─────────────────────────────────────
-def call_claude(news_text: str, today: str) -> str:
+def call_claude(news_text: str, today: str, window_label: str) -> str:
     """
     Call the Anthropic Messages API directly via urllib (no SDK needed).
     Returns the full HTML email body as a string.
@@ -76,11 +128,13 @@ def call_claude(news_text: str, today: str) -> str:
 
 Today is {today} (AEST).
 
-Below are today's raw AFL news headlines and summaries scraped from public RSS feeds:
+IMPORTANT TIME WINDOW: Only include news and information from {window_label}. Do NOT include older historical information or events from before this window. If a section has no news from {window_label}, write <li>Nothing to report from {window_label}.</li>
+
+Below are the raw AFL news headlines and summaries scraped from public RSS feeds (all from {window_label}):
 
 {news_text}
 
-Using ONLY the information above (do not invent or guess any facts), write a comprehensive HTML email digest following this EXACT template. Fill in each [FILL] section with real bullet points drawn from the headlines. If there is genuinely no news for a section, write <li>Nothing to report today.</li>
+Using ONLY the information above (do not invent or guess any facts), write a comprehensive HTML email digest following this EXACT template. Fill in each [FILL] section with real bullet points drawn from the headlines.
 
 <!DOCTYPE html>
 <html>
@@ -93,7 +147,7 @@ Using ONLY the information above (do not invent or guess any facts), write a com
   <p>G'day Daniel,</p>
 
   <h2 style="color:#cc0000;border-bottom:2px solid #cc0000;padding-bottom:4px;">&#128308; Melbourne Demons &#8212; Latest News</h2>
-  <ul>[FILL: 3-5 bullet points — Demons form, results, off-field news, each 1-2 sentences]</ul>
+  <ul>[FILL: 3-5 bullet points from {window_label} — Demons form, results, off-field news, each 1-2 sentences]</ul>
 
   <h2 style="color:#cc0000;border-bottom:2px solid #cc0000;padding-bottom:4px;">&#128203; Melbourne Demons &#8212; Player Availability</h2>
   <h4>&#9989; Playing / Selected:</h4>
@@ -106,19 +160,19 @@ Using ONLY the information above (do not invent or guess any facts), write a com
   <ul>[FILL: players close to returning from injury]</ul>
 
   <h2 style="color:#003087;border-bottom:2px solid #003087;padding-bottom:4px;">&#127942; AFL Headlines &#8212; Other Teams</h2>
-  <ul>[FILL: 4-6 bullet points covering a range of clubs]</ul>
+  <ul>[FILL: 4-6 bullet points from {window_label} covering a range of clubs]</ul>
 
   <h2 style="border-bottom:2px solid #888;padding-bottom:4px;">&#129318; Injuries &amp; Comebacks &#8212; League Wide</h2>
-  <ul>[FILL: notable injuries and returns across all clubs]</ul>
+  <ul>[FILL: notable injuries and returns across all clubs from {window_label}]</ul>
 
   <h2 style="border-bottom:2px solid #888;padding-bottom:4px;">&#128260; Trade &amp; List Management</h2>
-  <ul>[FILL: trade rumours, contracts, signings, delistings]</ul>
+  <ul>[FILL: trade rumours, contracts, signings, delistings from {window_label}]</ul>
 
   <h2 style="border-bottom:2px solid #888;padding-bottom:4px;">&#128084; AFL Administration &amp; Commission</h2>
-  <ul>[FILL: CEO, Commission decisions, governance, rule changes]</ul>
+  <ul>[FILL: CEO, Commission decisions, governance, rule changes from {window_label}]</ul>
 
   <h2 style="border-bottom:2px solid #888;padding-bottom:4px;">&#9889; Coaches &amp; Controversies</h2>
-  <ul>[FILL: coaching news, press conferences, disciplinary matters]</ul>
+  <ul>[FILL: coaching news, press conferences, disciplinary matters from {window_label}]</ul>
 
   <hr style="border:none;border-top:1px solid #ddd;margin:24px 0;">
   <p style="color:#888;font-size:12px;">&#8212; Your AFL Digest &#127945; | Sent automatically at 7:30 AM AEST | Powered by Claude AI + GitHub Actions</p>
@@ -128,6 +182,7 @@ Using ONLY the information above (do not invent or guess any facts), write a com
 
 Important rules:
 - Each bullet point must be 1-2 sentences drawn from the provided headlines
+- ONLY use information from {window_label} — do not reference anything older
 - Do not fabricate player names, scores, or events not mentioned in the headlines
 - Return ONLY the HTML — start with <!DOCTYPE html> and end with </html>
 """
@@ -195,14 +250,18 @@ def main():
 
     print(f"=== AFL Digest — {today} ===")
 
+    # Determine the relevant date window
+    date_from, date_to, window_label = get_date_window()
+    print(f"  Date window: {date_from} to {date_to} ({window_label})")
+
     print("\n[1/3] Fetching news from RSS feeds...")
-    news_text = fetch_all_news()
+    news_text = fetch_all_news(date_from, date_to)
     if not news_text.strip():
         print("ERROR: No news fetched. All feeds may be down.")
         sys.exit(1)
 
     print("\n[2/3] Generating digest with Claude AI...")
-    html_body = call_claude(news_text, today)
+    html_body = call_claude(news_text, today, window_label)
 
     print("\n[3/3] Sending email via Resend...")
     send_email(html_body, today)
